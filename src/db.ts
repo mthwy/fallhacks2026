@@ -49,6 +49,18 @@ export async function initDb() {
       created_at TEXT NOT NULL
     );
   `);
+
+  // Add saved recipe data to existing databases without deleting cooking history.
+  const cookLogColumns = await database.getAllAsync<{ name: string }>(
+    "PRAGMA table_info(cook_logs)"
+  );
+
+  if (!cookLogColumns.some(column => column.name === "recipe_json")) {
+    await database.execAsync(
+      "ALTER TABLE cook_logs ADD COLUMN recipe_json TEXT"
+    );
+  }
+
   return database;
 }
 
@@ -124,11 +136,12 @@ export async function confirmCook(recipe: Recipe, items: CookItem[]) {
 
   await db().withTransactionAsync(async () => {
     const result = await db().runAsync(
-      "INSERT INTO cook_logs(recipe_title, meal_type, cooked_at, servings) VALUES(?,?,?,?)",
+      "INSERT INTO cook_logs(recipe_title, meal_type, cooked_at, servings, recipe_json) VALUES(?,?,?,?,?)",
       recipe.title,
       recipe.mealType,
       new Date().toISOString(),
-      recipe.servings
+      recipe.servings,
+      JSON.stringify(recipe)
     );
     const logId = result.lastInsertRowId;
     const now = new Date().toISOString();
@@ -196,6 +209,7 @@ export async function getHistory() {
     meal_type: string;
     cooked_at: string;
     servings: number;
+    recipe_json: string | null;
   }>("SELECT * FROM cook_logs ORDER BY cooked_at DESC LIMIT 50");
 }
 

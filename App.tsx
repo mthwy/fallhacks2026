@@ -30,6 +30,7 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("Home");
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
   const [history, setHistory] = useState<any[]>([]);
+  const [historyDetail, setHistoryDetail] = useState<Recipe | null>(null);
   const [meal, setMeal] = useState<MealType>("dinner");
   const [recipes, setRecipes] = useState<Recipe[]>([]);
   const [selected, setSelected] = useState<Recipe | null>(null);
@@ -246,7 +247,7 @@ export default function App() {
     }
   }
 
-  function beginCooking(recipe: Recipe) {
+  function beginCooking(recipe: Recipe): boolean {
     const scaled = recipe.ingredients
       .filter(x => !x.optional)
       .map((ri) => {
@@ -270,12 +271,43 @@ export default function App() {
         "Ingredients not matched",
         "I couldn't match this recipe's ingredients to your pantry. Check that the ingredient names in your pantry match the recipe, then try again."
       );
-      return;
+      return false;
     }
 
     setCookItems(scaled);
     setCookStep(0);
     setSelected(recipe);
+    return true;
+  }
+
+  function openHistoryRecipe(entry: any) {
+    if (!entry.recipe_json) {
+      Alert.alert(
+        "Recipe unavailable",
+        "This cooking record was saved before recipe details were stored. New cooking sessions will include the full recipe."
+      );
+      return;
+    }
+
+    try {
+      const recipe = JSON.parse(entry.recipe_json) as Recipe;
+
+      if (
+        !recipe ||
+        !Array.isArray(recipe.ingredients) ||
+        !Array.isArray(recipe.steps)
+      ) {
+        throw new Error("The saved recipe is incomplete.");
+      }
+
+      setHistoryDetail(recipe);
+      setTab("History");
+    } catch {
+      Alert.alert(
+        "Couldn't open recipe",
+        "The saved recipe details could not be read."
+      );
+    }
   }
 
   function chooseSuggestedAmount(index: number, useSuggested: boolean) {
@@ -326,6 +358,7 @@ export default function App() {
     try {
       await confirmCook(selected, cookItems);
       setSelected(null);
+      setHistoryDetail(null);
       setCookItems([]);
       setCookStep(0);
       setTab("Home");
@@ -366,7 +399,7 @@ export default function App() {
       {selected ? (
         <ScrollView contentContainerStyle={styles.content}>
           <TouchableOpacity onPress={() => setSelected(null)}>
-            <Text style={styles.back}>‹ Back to recipes</Text>
+            <Text style={styles.back}>{historyDetail ? "‹ Back to recipe" : "‹ Back to recipes"}</Text>
           </TouchableOpacity>
 
           <Text style={styles.eyebrow}>COOKING MODE</Text>
@@ -484,6 +517,49 @@ export default function App() {
               </TouchableOpacity>
             </>
           )}
+        </ScrollView>
+      ) : historyDetail ? (
+        <ScrollView contentContainerStyle={styles.content}>
+          <TouchableOpacity onPress={() => setHistoryDetail(null)}>
+            <Text style={styles.back}>‹ Back to cooking history</Text>
+          </TouchableOpacity>
+
+          <Text style={styles.eyebrow}>SAVED RECIPE</Text>
+          <Text style={styles.h1}>{historyDetail.title}</Text>
+          <Text style={styles.muted}>
+            {historyDetail.mealType} · {historyDetail.prepMinutes} min prep · {historyDetail.cookMinutes} min cooking · {historyDetail.servings} servings
+          </Text>
+
+          {historyDetail.description ? (
+            <Text style={styles.body}>{historyDetail.description}</Text>
+          ) : null}
+
+          <View style={styles.infoCard}>
+            <Text style={styles.h2}>Ingredients</Text>
+            {historyDetail.ingredients.map((item: any, index: number) => (
+              <View key={`${item.name}-${index}`} style={styles.historyRecipeRow}>
+                <Text style={styles.body}>
+                  • {item.name} — {item.amount} {item.unit}
+                  {item.optional ? " (optional)" : ""}
+                </Text>
+              </View>
+            ))}
+          </View>
+
+          <Text style={styles.h2}>Instructions</Text>
+          {historyDetail.steps.map((step: string, index: number) => (
+            <View key={`history-step-${index}`} style={styles.historyStepRow}>
+              <Text style={styles.historyStepNumber}>{index + 1}</Text>
+              <Text style={[styles.body, { flex: 1 }]}>{step}</Text>
+            </View>
+          ))}
+
+          <TouchableOpacity
+            style={styles.primaryButton}
+            onPress={() => beginCooking(historyDetail)}
+          >
+            <Text style={styles.primaryText}>Cook this recipe again</Text>
+          </TouchableOpacity>
         </ScrollView>
       ) : showIngredientLibrary ? (
         <ScrollView contentContainerStyle={styles.content}>
@@ -692,9 +768,11 @@ export default function App() {
 
                 <Text style={styles.h2}>Recently cooked</Text>
                 {history.slice(0, 3).map(h => (
-                  <Text key={h.id} style={styles.historyLine}>
-                    🍽  {h.recipe_title}
-                  </Text>
+                  <TouchableOpacity key={h.id} onPress={() => openHistoryRecipe(h)}>
+                    <Text style={styles.historyLine}>
+                      🍽  {h.recipe_title}  →
+                    </Text>
+                  </TouchableOpacity>
                 ))}
               </>
             )}
@@ -844,12 +922,20 @@ export default function App() {
                 )}
 
                 {history.map(h => (
-                  <View key={h.id} style={styles.historyCard}>
+                  <TouchableOpacity
+                    key={h.id}
+                    style={styles.historyCard}
+                    onPress={() => openHistoryRecipe(h)}
+                    activeOpacity={0.75}
+                  >
                     <Text style={styles.itemName}>{h.recipe_title}</Text>
                     <Text style={styles.muted}>
                       {h.meal_type} · {new Date(h.cooked_at).toLocaleDateString()} · {h.servings} servings
                     </Text>
-                  </View>
+                    <Text style={styles.link}>
+                      {h.recipe_json ? "View recipe and instructions →" : "Recipe details unavailable →"}
+                    </Text>
+                  </TouchableOpacity>
                 ))}
 
                 {history.length > 0 && (
@@ -1279,6 +1365,30 @@ const styles = StyleSheet.create({
     borderRadius: 15,
     padding: 15,
     marginTop: 10
+  },
+  historyRecipeRow: {
+    paddingVertical: 5
+  },
+  historyStepRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 12,
+    backgroundColor: "#fff",
+    borderRadius: 14,
+    padding: 14,
+    marginTop: 9
+  },
+  historyStepNumber: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    overflow: "hidden",
+    textAlign: "center",
+    textAlignVertical: "center",
+    backgroundColor: PALE,
+    color: GREEN,
+    fontWeight: "800",
+    paddingTop: 4
   },
   tabBar: {
     flexDirection: "row",
