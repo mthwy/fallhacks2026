@@ -41,7 +41,7 @@ Edit `server/.env` and set your Gemini key:
 
 ```env
 GEMINI_API_KEY=your_real_key
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-3.5-flash
 PORT=4000
 ```
 
