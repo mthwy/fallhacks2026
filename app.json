@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "Pantry-to-Plate",
+    "slug": "pantry-to-plate",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "backgroundColor": "#F7F5EF"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.example.pantrytoplate"
+    },
+    "android": {
+      "package": "com.example.pantrytoplate",
+      "adaptiveIcon": {
+        "backgroundColor": "#F7F5EF"
+      }
+    },
+    "plugins": [
+      "expo-status-bar",
+      "expo-sqlite"
+    ]
+  }
+}
