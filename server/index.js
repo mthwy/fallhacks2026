@@ -126,7 +126,11 @@ app.post("/api/recipes", async (req, res) => {
     const {
       mealType,
       ingredients,
-      count = 4
+      count = 4,
+      maxMinutes = 0,
+      diet = "none",
+      avoid = "",
+      assumeStaples = true
     } = req.body || {};
 
     if (!["breakfast", "lunch", "dinner"].includes(mealType)) {
@@ -164,7 +168,13 @@ app.post("/api/recipes", async (req, res) => {
       5
     );
 
-    const prompt = `Create ${requestedCount} practical ${mealType} recipes using ONLY the supplied pantry ingredients. Do not invent pantry ingredients. Water, salt and pepper may be assumed only in tiny quantities; list them only if essential. Ingredient names in each recipe MUST exactly match one of the supplied pantry ingredient names. Amounts must not exceed the available amount for that ingredient. Use the provided units exactly; do not convert units. Return a JSON object with a "recipes" array. Each recipe must have: title (string), mealType ("${mealType}"), description (string), servings (positive integer), prepMinutes (number), cookMinutes (number), ingredients (array of {name, amount, unit, optional}), and steps (array of strings). Keep steps clear and beginner-friendly. Pantry: ${JSON.stringify(safeIngredients)}`;
+    const timeLimit = [15, 30, 45].includes(Number(maxMinutes)) ? Number(maxMinutes) : 0;
+    const validDiets = ["none", "vegetarian", "vegan", "pescatarian", "glutenfree", "dairyfree"];
+    const safeDiet = validDiets.includes(diet) ? diet : "none";
+    const safeAvoid = typeof avoid === "string" ? avoid.slice(0, 300) : "";
+    const forbidden = safeAvoid.split(/[,;\n]/).map(v => v.trim().toLowerCase()).filter(Boolean);
+    const assumeBasics = assumeStaples !== false;
+    const prompt = `Create ${requestedCount} practical ${mealType} recipes ${timeLimit ? `that each take no more than ${timeLimit} minutes total preparation and cooking time` : "with no cooking time limit"} using ONLY the supplied pantry ingredients${assumeBasics ? ", plus small amounts of salt, black pepper, or cooking oil" : ""}. Do not invent pantry ingredients. Water is allowed. Diet: ${safeDiet === "none" ? "no restriction" : safeDiet}. Never use these ingredients: ${safeAvoid || "none"}. If the diet or exclusions make some recipes impossible, return fewer recipes. Ingredient names in each recipe MUST exactly match one of the supplied pantry ingredient names. Amounts must not exceed the available amount for that ingredient. Use the provided units exactly; do not convert units. Return a JSON object with a "recipes" array. Each recipe must have: title (string), mealType ("${mealType}"), description (string), servings (positive integer), prepMinutes (number), cookMinutes (number), ingredients (array of {name, amount, unit, optional}), and steps (array of strings). Keep steps clear and beginner-friendly. Pantry: ${JSON.stringify(safeIngredients)}`;
 
     // Generate recipes, automatically retrying temporary 503 errors.
     const response = await generateWithRetry(ai, model, prompt);
@@ -195,18 +205,40 @@ app.post("/api/recipes", async (req, res) => {
       if (!checked.success) continue;
 
       const recipe = checked.data;
+      if (timeLimit && recipe.prepMinutes + recipe.cookMinutes > timeLimit) continue;
 
       if (recipe.mealType !== mealType) continue;
 
       const withinPantry = recipe.ingredients.every(ri => {
-        const available = pantry.get(ri.name.toLowerCase());
-
+        const lower = ri.name.trim().toLowerCase();
+        // Dietary and user exclusions are checked again on the device.
+        if (forbidden.some(term => lower.includes(term))) return false;
+        const available = pantry.get(lower);
+        if (!available && assumeBasics && ["salt", "black pepper", "pepper", "cooking oil", "oil"].includes(lower)) {
+          return true;
+        }
         return available &&
           available.unit.toLowerCase() === ri.unit.toLowerCase() &&
           (ri.optional || ri.amount <= available.amount);
       });
 
-      if (withinPantry) {
+      const restricted = recipe.ingredients.some(ri => {
+        if (ri.optional) return false;
+        const name = ri.name.toLowerCase();
+        const meat = /\b(chicken|beef|pork|bacon|sausage|turkey|ham|lamb)\b/.test(name);
+        const fish = /\b(salmon|tuna|shrimp|prawn|fish|anchovy)\b/.test(name);
+        const animal = /\b(egg|eggs|cheese|yogurt|butter|honey)\b/.test(name) ||
+          (/(?:^|\s)milk$/.test(name) && !/coconut|almond|soy|oat/.test(name));
+        const gluten = /\b(bread|flour|pasta|noodle|tortilla|wheat)\b/.test(name);
+        const dairy = /\b(cheese|yogurt|butter|cream)\b/.test(name) ||
+          (/(?:^|\s)milk$/.test(name) && !/coconut|almond|soy|oat/.test(name));
+        return (safeDiet === "vegetarian" && (meat || fish)) ||
+          (safeDiet === "vegan" && (meat || fish || animal)) ||
+          (safeDiet === "pescatarian" && meat) ||
+          (safeDiet === "glutenfree" && gluten) ||
+          (safeDiet === "dairyfree" && dairy);
+      });
+      if (withinPantry && !restricted) {
         validRecipes.push({
           ...recipe,
           source: "ai"

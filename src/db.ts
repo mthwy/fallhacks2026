@@ -1,5 +1,6 @@
 import * as SQLite from "expo-sqlite";
 import { Ingredient, Recipe, CookItem, ShoppingListItem } from "./types";
+import { DEFAULT_RECIPE_PREFERENCES, RecipePreferences } from "./recipeEngine";
 
 let database: SQLite.SQLiteDatabase;
 
@@ -39,6 +40,10 @@ export async function initDb() {
       delta REAL NOT NULL,
       reason TEXT NOT NULL,
       created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS app_preferences (
+      key TEXT PRIMARY KEY NOT NULL,
+      value TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS shopping_list (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -213,43 +218,44 @@ export async function getHistory() {
   }>("SELECT * FROM cook_logs ORDER BY cooked_at DESC LIMIT 50");
 }
 
-export async function undoLastCook() {
-  const last = await db().getFirstAsync<{ id: number }>(
-    "SELECT id FROM cook_logs ORDER BY id DESC LIMIT 1"
+/** Restore ingredients for any selected cooking entry and remove only that entry. */
+export async function undoCook(id: number) {
+  const log = await db().getFirstAsync<{ id: number }>(
+    "SELECT id FROM cook_logs WHERE id=?", id
   );
-  if (!last) return false;
+  if (!log) return false;
 
   await db().withTransactionAsync(async () => {
     const rows = await db().getAllAsync<{
       ingredient_id: number | null;
       deducted_amount: number;
-    }>(
-      "SELECT ingredient_id, deducted_amount FROM cook_log_items WHERE cook_log_id=?",
-      last.id
-    );
+    }>("SELECT ingredient_id, deducted_amount FROM cook_log_items WHERE cook_log_id=?", id);
 
     for (const row of rows) {
       if (row.ingredient_id !== null && row.deducted_amount > 0) {
-        await db().runAsync(
-          "UPDATE ingredients SET amount=amount+? WHERE id=?",
-          row.deducted_amount,
-          row.ingredient_id
+        const exists = await db().getFirstAsync<{ id: number }>(
+          "SELECT id FROM ingredients WHERE id=?", row.ingredient_id
         );
-        await db().runAsync(
-          "INSERT INTO adjustments(ingredient_id, delta, reason, created_at) VALUES(?,?,?,?)",
-          row.ingredient_id,
-          row.deducted_amount,
-          "undo",
-          new Date().toISOString()
-        );
+        if (exists) {
+          await db().runAsync("UPDATE ingredients SET amount=amount+? WHERE id=?", row.deducted_amount, row.ingredient_id);
+          await db().runAsync(
+            "INSERT INTO adjustments(ingredient_id, delta, reason, created_at) VALUES(?,?,?,?)",
+            row.ingredient_id, row.deducted_amount, "undo", new Date().toISOString()
+          );
+        }
       }
     }
-
-    await db().runAsync("DELETE FROM cook_log_items WHERE cook_log_id=?", last.id);
-    await db().runAsync("DELETE FROM cook_logs WHERE id=?", last.id);
+    await db().runAsync("DELETE FROM cook_log_items WHERE cook_log_id=?", id);
+    await db().runAsync("DELETE FROM cook_logs WHERE id=?", id);
   });
-
   return true;
+}
+
+export async function undoLastCook() {
+  const last = await db().getFirstAsync<{ id: number }>(
+    "SELECT id FROM cook_logs ORDER BY id DESC LIMIT 1"
+  );
+  return last ? undoCook(last.id) : false;
 }
 
 
@@ -343,4 +349,31 @@ export async function markShoppingItemPurchased(id: number) {
 
     await db().runAsync("DELETE FROM shopping_list WHERE id=?", id);
   });
+}
+/** Store offline recipe/diet preferences in the same SQLite database. */
+export async function getRecipePreferences(): Promise<RecipePreferences> {
+  const row = await db().getFirstAsync<{ value: string }>(
+    "SELECT value FROM app_preferences WHERE key=?", "recipes"
+  );
+  if (!row) return { ...DEFAULT_RECIPE_PREFERENCES };
+  try {
+    const p = JSON.parse(row.value);
+    const diets = ["none", "vegetarian", "vegan", "pescatarian", "glutenfree", "dairyfree"];
+    return {
+      diet: diets.includes(p.diet) ? p.diet : "none",
+      avoid: typeof p.avoid === "string" ? p.avoid : "",
+      assumeStaples: typeof p.assumeStaples === "boolean" ? p.assumeStaples : true,
+      defaultServings: Number.isInteger(p.defaultServings) ? Math.max(1, Math.min(12, p.defaultServings)) : 2
+    };
+  } catch {
+    return { ...DEFAULT_RECIPE_PREFERENCES };
+  }
+}
+
+export async function saveRecipePreferences(input: RecipePreferences): Promise<void> {
+  await db().runAsync(
+    `INSERT INTO app_preferences(key, value) VALUES(?, ?)
+     ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+    "recipes", JSON.stringify(input)
+  );
 }

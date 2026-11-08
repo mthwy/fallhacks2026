@@ -7,11 +7,15 @@ import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import {
   addToShoppingList, confirmCook, deleteIngredient, getHistory,
   getShoppingList, initDb, listIngredients, markShoppingItemPurchased,
-  removeShoppingListItem, saveIngredient, undoLastCook
+  removeShoppingListItem, saveIngredient, undoCook, getRecipePreferences, saveRecipePreferences
 } from "./src/db";
 import { generateRecipes } from "./src/api";
 import { CookItem, Ingredient, MealType, Recipe, ShoppingListItem } from "./src/types";
 import { INGREDIENT_CATALOG, INGREDIENT_CATEGORIES } from "./src/ingredientCatalog";
+import {
+  DEFAULT_RECIPE_PREFERENCES, RecipePreferences, Diet, daysUntilExpiry,
+  offlineRecipes, recipeAvailabilityFor, makeSuggestions, scaleRecipe
+} from "./src/recipeEngine";
 
 type Tab = "Home" | "Pantry" | "Recipes" | "Shopping" | "History";
 
@@ -20,7 +24,7 @@ const PALE = "#E8F3E8";
 const CREAM = "#F7F5EF";
 
 const UNIT_GROUPS = [
-  { title: "Count", units: ["pcs", "whole", "clove", "slice", "piece", "bunch", "can", "package"] },
+  { title: "Count", units: ["pcs", "slice", "bunch", "can", "pack"] },
   { title: "Weight", units: ["g", "kg", "oz", "lb"] },
   { title: "Volume", units: ["ml", "L", "tsp", "tbsp", "cup", "pint", "quart"] }
 ];
@@ -34,10 +38,16 @@ const MEASURES: Record<string, [string, number]> = {
   tsp: ["volume", 5], tbsp: ["volume", 15], cup: ["volume", 240],
   pint: ["volume", 473.176], quart: ["volume", 946.353],
   pcs: ["count", 1], piece: ["count", 1], whole: ["count", 1],
-  clove: ["count", 1], slice: ["count", 1], bunch: ["count", 1],
+  clove: ["clove", 1], slice: ["slice", 1], bunch: ["bunch", 1],
   can: ["can", 1], package: ["package", 1], pack: ["package", 1]
 };
+function normalizeUnit(value: string): string {
+  const u = value.trim().toLowerCase();
+  return ({ piece: "pcs", pieces: "pcs", pc: "pcs", whole: "pcs", package: "pack", packages: "pack" } as Record<string, string>)[u] || u;
+}
 function pantryAmount(amount: number, from: string, to: string): number | null {
+  from = normalizeUnit(from);
+  to = normalizeUnit(to);
   const fromUnit = MEASURES[from.trim().toLowerCase()];
   const toUnit = MEASURES[to.trim().toLowerCase()];
   if (from.trim().toLowerCase() === to.trim().toLowerCase()) return amount;
@@ -60,6 +70,13 @@ export default function App() {
   const [preview, setPreview] = useState<Recipe | null>(null);
   const [previewServings, setPreviewServings] = useState(2);
   const [busy, setBusy] = useState(false);
+  const [maxMinutes, setMaxMinutes] = useState(0);
+  const [preferences, setPreferences] = useState<RecipePreferences>(DEFAULT_RECIPE_PREFERENCES);
+  const [showPreferences, setShowPreferences] = useState(false);
+  const [recipeSearch, setRecipeSearch] = useState("");
+  const [recipeSource, setRecipeSource] = useState<"all" | "offline" | "ai">("all");
+  const generationRef = useRef<AbortController | null>(null);
+  const generationId = useRef(0);
   const [error, setError] = useState("");
   const [cookStep, setCookStep] = useState(0);
   const [cookItems, setCookItems] = useState<CookItem[]>([]);
@@ -73,6 +90,7 @@ export default function App() {
   const [amount, setAmount] = useState("1");
   const [unit, setUnit] = useState("pcs");
   const [category, setCategory] = useState("Other");
+  const [expiryDate, setExpiryDate] = useState("");
   const [servings, setServings] = useState("2");
   const [showUnitPicker, setShowUnitPicker] = useState(false);
   const [customUnit, setCustomUnit] = useState("");
@@ -92,6 +110,8 @@ export default function App() {
 
   useEffect(() => {
     initDb().then(async () => {
+      const savedPreferences = await getRecipePreferences();
+      setPreferences(savedPreferences);
       await refresh();
       setReady(true);
     }).catch((e) => Alert.alert("Database error", String(e)));
@@ -160,6 +180,30 @@ export default function App() {
     () => ingredients.filter(i => i.amount > 0 && i.amount <= 2),
     [ingredients]
   );
+  const offline = useMemo(
+    () => offlineRecipes(meal, ingredients, preferences), [meal, ingredients, preferences]
+  );
+  const suggested = useMemo(
+    () => makeSuggestions(
+      [...offline, ...recipes.filter(r => r.mealType === meal)],
+      ingredients, preferences, history, maxMinutes
+    ), [offline, recipes, meal, ingredients, preferences, history, maxMinutes]
+  );
+  const visibleSuggestions = useMemo(() => suggested.filter(entry =>
+    (recipeSource === "all" || entry.source === recipeSource) &&
+    entry.recipe.title.toLowerCase().includes(recipeSearch.trim().toLowerCase())
+  ), [suggested, recipeSource, recipeSearch]);
+  const readySuggestions = visibleSuggestions.filter(r => r.missing === 0);
+  const almostSuggestions = visibleSuggestions.filter(r => r.missing > 0);
+  const expiringIngredients = ingredients.filter(i => i.amount > 0 &&
+    daysUntilExpiry(i) !== null && daysUntilExpiry(i)! >= 0 && daysUntilExpiry(i)! <= 3)
+    .sort((a,b) => (daysUntilExpiry(a) || 0) - (daysUntilExpiry(b) || 0));
+
+  function changePreferences(next: RecipePreferences) {
+    setPreferences(next);
+    saveRecipePreferences(next).catch(e => Alert.alert("Couldn't save preferences", String(e)));
+  }
+
   const filteredCatalog = useMemo(() => {
     const query = ingredientSearch.trim().toLowerCase();
     return INGREDIENT_CATALOG.filter(item =>
@@ -172,8 +216,9 @@ export default function App() {
     setEditing(item ?? null);
     setName(item?.name ?? "");
     setAmount(String(item?.amount ?? 1));
-    setUnit(item?.unit ?? "pcs");
+    setUnit(normalizeUnit(item?.unit ?? "pcs"));
     setCategory(item?.category ?? "Other");
+    setExpiryDate(item?.expiryDate ?? "");
     setShowIngredientForm(Boolean(item));
     setShowIngredientLibrary(!item);
     setIngredientSearch("");
@@ -185,8 +230,9 @@ export default function App() {
     setEditing(existing ?? null);
     setName(existing?.name ?? item.name);
     setAmount(String(existing?.amount ?? 1));
-    setUnit(existing?.unit ?? item.unit);
+    setUnit(normalizeUnit(existing?.unit ?? item.unit));
     setCategory(existing?.category ?? item.category);
+    setExpiryDate(existing?.expiryDate ?? "");
     setShowIngredientLibrary(false);
     setShowIngredientForm(true);
   }
@@ -197,6 +243,7 @@ export default function App() {
     setAmount("1");
     setUnit("pcs");
     setCategory("Other");
+    setExpiryDate("");
     setShowIngredientLibrary(false);
     setShowIngredientForm(true);
   }
@@ -235,13 +282,21 @@ export default function App() {
       return;
     }
 
+    const enteredExpiry = expiryDate.trim();
+    const parsedExpiry = enteredExpiry ? new Date(`${enteredExpiry}T12:00:00`) : null;
+    if (enteredExpiry && (!/^\d{4}-\d{2}-\d{2}$/.test(enteredExpiry) ||
+      !parsedExpiry || Number.isNaN(parsedExpiry.getTime()) ||
+      `${parsedExpiry.getFullYear()}-${String(parsedExpiry.getMonth() + 1).padStart(2,"0")}-${String(parsedExpiry.getDate()).padStart(2,"0")}` !== enteredExpiry)) {
+      Alert.alert("Invalid best-before date", "Enter a date as YYYY-MM-DD, or leave it blank.");
+      return;
+    }
     try {
       await saveIngredient({
         name,
         amount: Number(amount),
-        unit,
+        unit: normalizeUnit(unit),
         category,
-        expiryDate: editing?.expiryDate ?? null
+        expiryDate: expiryDate.trim() || null
       }, editing?.id);
 
       setShowIngredientForm(false);
@@ -251,63 +306,94 @@ export default function App() {
     }
   }
 
+  function cancelGeneration() {
+    generationId.current += 1;
+    generationRef.current?.abort();
+    generationRef.current = null;
+    setBusy(false);
+  }
+
+  function pickForMe() {
+    const choices = tab === "Recipes" ? visibleSuggestions : suggested;
+    const ready = choices.filter(entry => entry.missing === 0);
+    const pool = ready.length ? ready : choices;
+    if (!pool.length) {
+      Alert.alert("No matching recipes", "Try a longer cooking time or change your dietary preferences.");
+      return;
+    }
+    // Use a small group of best fits; randomness keeps suggestions varied.
+    const shortlist = pool.slice(0, Math.min(8, pool.length));
+    const choice = shortlist[Math.floor(Math.random() * shortlist.length)];
+    setTab("Recipes");
+    openRecipe(choice.recipe);
+    if (!ready.length) {
+      Alert.alert("Closest recipe", "No recipe can be made entirely from your current pantry. Here's an idea with a few missing ingredients.");
+    }
+  }
+
+  function confirmUndoHistory(id: number, title: string) {
+    Alert.alert("Undo this meal?", `Restore the ingredients used for ${title} and remove its history entry?`, [
+      { text: "Cancel", style: "cancel" },
+      { text: "Undo meal", style: "destructive", onPress: async () => {
+        try {
+          const ok = await undoCook(id);
+          await refresh();
+          if (ok) setHistoryDetail(null);
+          Alert.alert(ok ? "Meal undone" : "Entry not found", ok ? "Ingredients restored where the pantry item still exists." : "This entry no longer exists.");
+        } catch (e: any) { Alert.alert("Couldn't undo meal", e.message || String(e)); }
+      } }
+    ]);
+  }
+
   async function makeRecipes() {
     if (availableIngredients.length === 0) {
       setError("Add some ingredients with a quantity greater than zero before generating recipes.");
       return;
     }
+    const controller = new AbortController();
+    const id = ++generationId.current;
+    generationRef.current = controller;
     setBusy(true);
     setError("");
-    setRecipes([]);
     setSelected(null);
 
     try {
-      const results = await generateRecipes(availableIngredients, meal);
+      const results = await generateRecipes(availableIngredients, meal, 4, {
+        signal: controller.signal,
+        maxMinutes,
+        diet: preferences.diet,
+        avoid: preferences.avoid,
+        assumeStaples: preferences.assumeStaples
+      });
+      if (generationId.current !== id || controller.signal.aborted) return;
       setRecipes(results);
       setTab("Recipes");
+      if (!results.length) setError("No recipes fit your chosen time. Try Any time or add more ingredients.");
     } catch (e: any) {
-      setError(e.message || "Recipe generation failed.");
+      if (generationId.current === id && !controller.signal.aborted) {
+        setError(e.message || "Recipe generation failed.");
+      }
     } finally {
-      setBusy(false);
+      if (generationId.current === id) {
+        generationRef.current = null;
+        setBusy(false);
+      }
     }
   }
 
   function openRecipe(recipe: Recipe) {
     setPreview(recipe);
-    setPreviewServings(Math.max(1, Math.min(12, Math.round(recipe.servings || 2))));
+    setPreviewServings(Math.max(1, Math.min(12, preferences.defaultServings)));
   }
 
   // Keep the original AI recipe intact; scale a copy so cooking history
   // stores the exact ingredient amounts for the selected serving count.
   function scaledRecipe(recipe: Recipe, count: number): Recipe {
-    const base = Number(recipe.servings) > 0 ? Number(recipe.servings) : 2;
-    const ratio = count / base;
-    return {
-      ...recipe,
-      servings: count,
-      ingredients: recipe.ingredients.map(item => ({
-        ...item,
-        amount: Math.round(Number(item.amount) * ratio * 10000) / 10000
-      }))
-    };
+    return scaleRecipe(recipe, count);
   }
 
   function recipeAvailability(recipe: Recipe) {
-    return recipe.ingredients.map(item => {
-      const pantryItem = ingredients.find(
-        i => i.name.trim().toLowerCase() === item.name.trim().toLowerCase()
-      );
-      const neededInPantryUnit = pantryItem
-        ? pantryAmount(Number(item.amount), item.unit, pantryItem.unit)
-        : null;
-      const available = pantryItem?.amount ?? 0;
-      return {
-        item, pantryItem, neededInPantryUnit, available,
-        enough: !!pantryItem && neededInPantryUnit !== null &&
-          available + 0.000001 >= neededInPantryUnit,
-        incompatible: !!pantryItem && neededInPantryUnit === null
-      };
-    });
+    return recipeAvailabilityFor(recipe, ingredients, preferences);
   }
 
   async function addMissingToShopping(recipe: Recipe) {
@@ -343,7 +429,7 @@ export default function App() {
       return false;
     }
     const cookingItems: CookItem[] = availability
-      .filter(x => x.enough && !!x.pantryItem)
+      .filter(x => x.enough && !x.assumed && !!x.pantryItem)
       .map(x => ({
         ingredientId: x.pantryItem!.id,
         name: x.pantryItem!.name,
@@ -664,8 +750,12 @@ export default function App() {
                   {entry.item.optional ? " (optional)" : ""}
                 </Text>
                 <Text style={[styles.muted, !entry.enough && !entry.item.optional && styles.previewShortage]}>
-                  {entry.enough
-                    ? `In pantry: ${showAmount(entry.available)} ${entry.pantryItem!.unit}`
+                  {entry.assumed
+                    ? "Assumed staple · not deducted from pantry"
+                    : entry.expired
+                    ? "Past entered best-before date · check your pantry"
+                    : entry.enough
+                    ? `In pantry: ${showAmount(entry.available)} ${entry.pantryItem!.unit}${entry.expiringSoon ? " · use soon" : ""}`
                     : entry.incompatible
                     ? `Pantry unit is ${entry.pantryItem!.unit}; quantity needs checking`
                     : entry.item.optional
@@ -837,6 +927,15 @@ export default function App() {
             <Text style={styles.unitSelectArrow}>⌄</Text>
           </TouchableOpacity>
 
+          <Text style={styles.label}>Best-before date (optional)</Text>
+          <TextInput
+            style={styles.input}
+            value={expiryDate}
+            onChangeText={setExpiryDate}
+            placeholder="YYYY-MM-DD"
+            autoCapitalize="none"
+            keyboardType="numbers-and-punctuation"
+          />
           <Text style={styles.label}>Category</Text>
           <TextInput
             style={styles.input}
@@ -894,6 +993,67 @@ export default function App() {
                   ))}
                 </View>
 
+                <Text style={[styles.label, { marginTop: 16 }]}>Time available</Text>
+                <View style={[styles.mealRow, { flexWrap: "wrap" }]}>
+                  {([0, 15, 30, 45] as number[]).map(t => (
+                    <TouchableOpacity key={t} onPress={() => setMaxMinutes(t)}
+                      style={[styles.mealChip, maxMinutes === t && styles.mealSelected]}>
+                      <Text style={[styles.mealText, maxMinutes === t && styles.mealTextSelected]}>
+                        {t === 0 ? "Any time" : `Under ${t} min`}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                <TouchableOpacity style={styles.secondaryButton} onPress={() => setShowPreferences(!showPreferences)}>
+                  <Text style={styles.secondaryText}>⚙ Dietary preferences & serving size {showPreferences ? "⌃" : "⌄"}</Text>
+                </TouchableOpacity>
+                {showPreferences && (
+                  <View style={styles.preferenceCard}>
+                    <Text style={styles.label}>Dietary preference</Text>
+                    <View style={styles.preferenceChips}>
+                      {(["none", "vegetarian", "vegan", "pescatarian", "glutenfree", "dairyfree"] as Diet[]).map(d => (
+                        <TouchableOpacity key={d} style={[styles.preferenceChip, preferences.diet === d && styles.mealSelected]}
+                          onPress={() => changePreferences({ ...preferences, diet: d })}>
+                          <Text style={styles.mealText}>{({ none: "No restriction", vegetarian: "Vegetarian", vegan: "Vegan",
+                            pescatarian: "Pescatarian", glutenfree: "Gluten-free", dairyfree: "Dairy-free" } as Record<Diet, string>)[d]}</Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                    <Text style={styles.label}>Exclude ingredients (comma separated)</Text>
+                    <TextInput style={styles.input} value={preferences.avoid}
+                      placeholder="e.g. mushrooms, peanuts" onChangeText={v => setPreferences(old => ({ ...old, avoid: v }))}
+                      onEndEditing={() => saveRecipePreferences(preferences).catch(e => Alert.alert("Couldn't save preferences", String(e)))} />
+                    <TouchableOpacity style={styles.secondaryButton} onPress={() => {
+                      saveRecipePreferences(preferences).then(() => Alert.alert("Saved", "Ingredient exclusions saved."))
+                        .catch(e => Alert.alert("Couldn't save preferences", String(e)));
+                    }}>
+                      <Text style={styles.secondaryText}>Save excluded ingredients</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.preferenceToggle} onPress={() => changePreferences({ ...preferences, assumeStaples: !preferences.assumeStaples })}>
+                      <Text style={styles.body}>{preferences.assumeStaples ? "☑" : "☐"} Assume salt, pepper and oil</Text>
+                    </TouchableOpacity>
+                    <View style={styles.rowBetween}>
+                      <Text style={styles.body}>Default servings: {preferences.defaultServings}</Text>
+                      <View style={styles.preferenceStepper}>
+                        <TouchableOpacity onPress={() => changePreferences({ ...preferences, defaultServings: Math.max(1, preferences.defaultServings - 1) })}>
+                          <Text style={styles.previewStepText}>−</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity onPress={() => changePreferences({ ...preferences, defaultServings: Math.min(12, preferences.defaultServings + 1) })}>
+                          <Text style={styles.previewStepText}>＋</Text>
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                    <Text style={styles.muted}>Dietary checks are ingredient-based; check labels for allergies and cross-contact.</Text>
+                  </View>
+                )}
+
+                <TouchableOpacity style={styles.secondaryButton} onPress={() => {
+                  setTab("Recipes"); setRecipeSource("all");
+                }}>
+                  <Text style={styles.secondaryText}>📖 Browse {offline.length} offline {meal} recipes →</Text>
+                </TouchableOpacity>
+
                 <TouchableOpacity
                   style={styles.primaryButton}
                   onPress={makeRecipes}
@@ -903,9 +1063,13 @@ export default function App() {
                     <ActivityIndicator color="#fff" />
                   ) : (
                     <Text style={styles.primaryText}>
-                      ✦  Find recipes for me
+                      ✦  Generate more with Gemini
                     </Text>
                   )}
+                </TouchableOpacity>
+
+                <TouchableOpacity style={styles.secondaryButton} onPress={pickForMe}>
+                  <Text style={styles.secondaryText}>🎲  Pick for me</Text>
                 </TouchableOpacity>
 
                 {error ? (
@@ -939,6 +1103,20 @@ export default function App() {
                     </TouchableOpacity>
                   )}
                 </View>
+
+                {expiringIngredients.length > 0 && (
+                  <View style={styles.warningCard}>
+                    <Text style={styles.h2}>Use these up soon</Text>
+                    <Text style={styles.body}>
+                      {expiringIngredients.slice(0, 5).map(i =>
+                        `${i.name} (${daysUntilExpiry(i) === 0 ? "today" : `${daysUntilExpiry(i)}d left`})`
+                      ).join(" · ")}
+                    </Text>
+                    <TouchableOpacity onPress={() => setTab("Recipes")}>
+                      <Text style={styles.link}>See recipes that use them →</Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
 
                 {lowItems.length > 0 && (
                   <View style={styles.warningCard}>
@@ -987,7 +1165,7 @@ export default function App() {
                       </View>
                       <View style={{ flex: 1 }}>
                         <Text style={styles.itemName}>{item.name}</Text>
-                        <Text style={styles.muted}>{item.category}</Text>
+                        <Text style={styles.muted}>{item.category}{item.expiryDate ? ` · Best before ${item.expiryDate}` : ""}</Text>
                       </View>
                       <Text style={styles.amountText}>{item.amount} {item.unit}</Text>
                       <TouchableOpacity onPress={() => openAdd(item)} style={styles.iconButton}><Text>✎</Text></TouchableOpacity>
@@ -1031,36 +1209,70 @@ export default function App() {
 
             {tab === "Recipes" && (
               <>
-                <Text style={styles.h1}>Recipe suggestions</Text>
-                <Text style={styles.muted}>
-                  Ideas using ingredients you already have.
-                </Text>
+                <Text style={styles.h1}>Find something to cook</Text>
+                <Text style={styles.muted}>Offline recipes are available immediately. Gemini ideas appear here when generated.</Text>
 
-                {recipes.length === 0 && (
-                  <Text style={styles.empty}>
-                    Choose a meal on Home and tap “Find recipes for me”.
-                  </Text>
-                )}
+                <View style={styles.mealRow}>
+                  {(["breakfast", "lunch", "dinner"] as MealType[]).map(m => (
+                    <TouchableOpacity key={m} style={[styles.mealChip, meal === m && styles.mealSelected]} onPress={() => setMeal(m)}>
+                      <Text style={[styles.mealText, meal === m && styles.mealTextSelected]}>{m}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+                <View style={[styles.mealRow, { flexWrap: "wrap", marginVertical: 4 }]}>
+                  {[0,15,30,45].map(t => (
+                    <TouchableOpacity key={t} style={[styles.mealChip, maxMinutes === t && styles.mealSelected]} onPress={() => setMaxMinutes(t)}>
+                      <Text style={styles.mealText}>{t === 0 ? "Any time" : `≤ ${t} min`}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
 
-                {recipes.map((r, i) => (
-                  <TouchableOpacity
-                    key={`${r.title}-${i}`}
-                    style={styles.recipeCard}
-                    onPress={() => openRecipe(r)}
-                  >
-                    <View style={styles.recipeEmoji}>
-                      <Text style={{ fontSize: 30 }}>🍲</Text>
-                    </View>
+                <View style={styles.searchBox}>
+                  <Text style={styles.searchIcon}>⌕</Text>
+                  <TextInput style={styles.searchInput} value={recipeSearch} onChangeText={setRecipeSearch}
+                    placeholder="Search recipes..." placeholderTextColor="#89938C" />
+                </View>
+                <View style={styles.preferenceChips}>
+                  {(["all", "offline", "ai"] as const).map(src => (
+                    <TouchableOpacity key={src} style={[styles.preferenceChip, recipeSource === src && styles.mealSelected]}
+                      onPress={() => setRecipeSource(src)}>
+                      <Text style={styles.mealText}>{src === "all" ? "All" : src === "offline" ? "📖 Offline" : "✦ Gemini"}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+                <TouchableOpacity style={styles.secondaryButton} onPress={pickForMe}>
+                  <Text style={styles.secondaryText}>🎲 Pick for me from available recipes</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.secondaryButton} onPress={makeRecipes} disabled={busy || !availableIngredients.length}>
+                  <Text style={styles.secondaryText}>✦ Generate new Gemini recipes</Text>
+                </TouchableOpacity>
+                <Text style={styles.muted}>Using your dietary preferences and pantry amounts · {readySuggestions.length} ready · {almostSuggestions.length} missing items</Text>
+                {error ? <Text style={styles.error}>{error}</Text> : null}
+                {visibleSuggestions.length === 0 ? (
+                  <Text style={styles.empty}>No matches. Try a different meal, time, search, or dietary setting.</Text>
+                ) : null}
 
+                {readySuggestions.length > 0 && <Text style={styles.h2}>✓ Ready to cook ({readySuggestions.length})</Text>}
+                {readySuggestions.map((entry, i) => (
+                  <TouchableOpacity key={`ready-${entry.source}-${entry.recipe.title}-${i}`} style={styles.recipeCard} onPress={() => openRecipe(entry.recipe)}>
+                    <View style={styles.recipeEmoji}><Text style={{ fontSize: 29 }}>🍽</Text></View>
                     <View style={{ flex: 1 }}>
-                      <Text style={styles.recipeTitle}>{r.title}</Text>
-                      <Text style={styles.muted}>
-                        {r.prepMinutes + r.cookMinutes} min · {r.servings} servings
-                      </Text>
-                      <Text style={styles.recipeDesc}>
-                        {r.description}
-                      </Text>
-                      <Text style={styles.link}>View recipe →</Text>
+                      <Text style={styles.recipeTitle}>{entry.recipe.title}</Text>
+                      <Text style={styles.muted}>{entry.recipe.prepMinutes + entry.recipe.cookMinutes} min · {entry.source === "offline" ? "📖 Offline" : "✦ Gemini"} · {entry.recipe.servings} base servings</Text>
+                      {entry.soonCount > 0 ? <Text style={styles.useSoonTag}>Uses {entry.soonCount} ingredient{entry.soonCount === 1 ? "" : "s"} expiring soon</Text> : null}
+                      <Text style={styles.link}>View ingredients & steps →</Text>
+                    </View>
+                  </TouchableOpacity>
+                ))}
+                {almostSuggestions.length > 0 && <Text style={styles.h2}>🛒 Missing ingredients ({almostSuggestions.length})</Text>}
+                {almostSuggestions.map((entry, i) => (
+                  <TouchableOpacity key={`missing-${entry.source}-${entry.recipe.title}-${i}`} style={styles.recipeCard} onPress={() => openRecipe(entry.recipe)}>
+                    <View style={styles.recipeEmoji}><Text style={{ fontSize: 29 }}>🥣</Text></View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.recipeTitle}>{entry.recipe.title}</Text>
+                      <Text style={styles.muted}>{entry.recipe.prepMinutes + entry.recipe.cookMinutes} min · {entry.source === "offline" ? "📖 Offline" : "✦ Gemini"}</Text>
+                      <Text style={styles.shortageTag}>Missing {entry.missing} required ingredient{entry.missing === 1 ? "" : "s"}</Text>
+                      <Text style={styles.link}>See what's missing →</Text>
                     </View>
                   </TouchableOpacity>
                 ))}
@@ -1107,12 +1319,8 @@ export default function App() {
                 )}
 
                 {history.map(h => (
-                  <TouchableOpacity
-                    key={h.id}
-                    style={styles.historyCard}
-                    onPress={() => openHistoryRecipe(h)}
-                    activeOpacity={0.75}
-                  >
+                  <View key={h.id} style={styles.historyCard}>
+                    <TouchableOpacity onPress={() => openHistoryRecipe(h)} activeOpacity={0.75}>
                     <Text style={styles.itemName}>{h.recipe_title}</Text>
                     <Text style={styles.muted}>
                       {h.meal_type} · {new Date(h.cooked_at).toLocaleDateString()} · {h.servings} servings
@@ -1120,29 +1328,14 @@ export default function App() {
                     <Text style={styles.link}>
                       {h.recipe_json ? "View recipe and instructions →" : "Recipe details unavailable →"}
                     </Text>
-                  </TouchableOpacity>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.secondaryButton, { marginTop: 10 }]}
+                      onPress={() => confirmUndoHistory(h.id, h.recipe_title)}>
+                      <Text style={styles.secondaryText}>↶ Undo this meal</Text>
+                    </TouchableOpacity>
+                  </View>
                 ))}
 
-                {history.length > 0 && (
-                  <TouchableOpacity
-                    style={styles.secondaryButton}
-                    onPress={async () => {
-                      const ok = await undoLastCook();
-                      await refresh();
-
-                      Alert.alert(
-                        ok ? "Last meal undone" : "Nothing to undo",
-                        ok
-                          ? "Ingredient quantities were restored."
-                          : "There is no cooking record to undo."
-                      );
-                    }}
-                  >
-                    <Text style={styles.secondaryText}>
-                      Undo last cooking session
-                    </Text>
-                  </TouchableOpacity>
-                )}
               </>
             )}
           </ScrollView>
@@ -1240,7 +1433,7 @@ export default function App() {
         transparent
         animationType="fade"
         statusBarTranslucent
-        onRequestClose={() => {}}
+        onRequestClose={cancelGeneration}
       >
         <View style={styles.loadingOverlay}>
           <View style={styles.loadingCard}>
@@ -1274,6 +1467,11 @@ export default function App() {
               Generating for {Math.floor(loadingSeconds / 60)}:
               {String(loadingSeconds % 60).padStart(2, "0")}
             </Text>
+
+            <TouchableOpacity style={[styles.secondaryButton, { marginTop: 18, alignSelf: "stretch" }]}
+              onPress={cancelGeneration}>
+              <Text style={styles.secondaryText}>Cancel generation</Text>
+            </TouchableOpacity>
 
             {loadingSeconds >= 60 && (
               <Text style={styles.loadingHint}>
@@ -1420,6 +1618,13 @@ const styles = StyleSheet.create({
   },
   label: { fontWeight: "700", color: "#35433A", marginTop: 8 },
   back: { color: GREEN, fontWeight: "800", marginBottom: 18, fontSize: 15 },
+  preferenceCard: { backgroundColor: "#fff", borderRadius: 16, padding: 14, marginTop: 10, gap: 8 },
+  preferenceChips: { flexDirection: "row", flexWrap: "wrap", gap: 7, marginVertical: 9 },
+  preferenceChip: { backgroundColor: "#EAE9E4", borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10 },
+  preferenceToggle: { paddingVertical: 9 },
+  preferenceStepper: { flexDirection: "row", gap: 25, paddingHorizontal: 12, alignItems: "center" },
+  useSoonTag: { marginTop: 5, color: GREEN, fontWeight: "700", fontSize: 12 },
+  shortageTag: { marginTop: 5, color: "#996017", fontWeight: "700", fontSize: 12 },
   recipeCard: {
     backgroundColor: "#fff",
     borderRadius: 18,

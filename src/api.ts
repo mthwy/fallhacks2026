@@ -7,7 +7,8 @@ const API_URL =
 export async function generateRecipes(
   ingredients: Ingredient[],
   mealType: MealType,
-  count = 4
+  count = 4,
+  options: { signal?: AbortSignal; maxMinutes?: number; diet?: string; avoid?: string; assumeStaples?: boolean } = {}
 ): Promise<Recipe[]> {
   const availableIngredients = ingredients
     .filter((item) => item.amount > 0)
@@ -22,9 +23,14 @@ export async function generateRecipes(
     headers: {
       "Content-Type": "application/json",
     },
+    signal: options.signal,
     body: JSON.stringify({
       mealType,
       count,
+      maxMinutes: options.maxMinutes || 0,
+      diet: options.diet || "none",
+      avoid: options.avoid || "",
+      assumeStaples: options.assumeStaples ?? true,
       ingredients: availableIngredients,
     }),
   });
