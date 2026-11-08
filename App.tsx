@@ -25,6 +25,29 @@ const UNIT_GROUPS = [
   { title: "Volume", units: ["ml", "L", "tsp", "tbsp", "cup", "pint", "quart"] }
 ];
 
+// Convert compatible measurement units before comparing or deducting pantry stock.
+// Different measurement families (for example cups versus grams) cannot be safely
+// converted without knowing the ingredient density, so those are flagged instead.
+const MEASURES: Record<string, [string, number]> = {
+  g: ["weight", 1], kg: ["weight", 1000], oz: ["weight", 28.349523125],
+  lb: ["weight", 453.59237], ml: ["volume", 1], l: ["volume", 1000],
+  tsp: ["volume", 5], tbsp: ["volume", 15], cup: ["volume", 240],
+  pint: ["volume", 473.176], quart: ["volume", 946.353],
+  pcs: ["count", 1], piece: ["count", 1], whole: ["count", 1],
+  clove: ["count", 1], slice: ["count", 1], bunch: ["count", 1],
+  can: ["can", 1], package: ["package", 1], pack: ["package", 1]
+};
+function pantryAmount(amount: number, from: string, to: string): number | null {
+  const fromUnit = MEASURES[from.trim().toLowerCase()];
+  const toUnit = MEASURES[to.trim().toLowerCase()];
+  if (from.trim().toLowerCase() === to.trim().toLowerCase()) return amount;
+  if (!fromUnit || !toUnit || fromUnit[0] !== toUnit[0]) return null;
+  return amount * fromUnit[1] / toUnit[1];
+}
+function showAmount(value: number): string {
+  return String(Math.round(value * 100) / 100);
+}
+
 export default function App() {
   const [ready, setReady] = useState(false);
   const [tab, setTab] = useState<Tab>("Home");
@@ -34,6 +57,8 @@ export default function App() {
   const [meal, setMeal] = useState<MealType>("dinner");
   const [recipes, setRecipes] = useState<Recipe[]>([]);
   const [selected, setSelected] = useState<Recipe | null>(null);
+  const [preview, setPreview] = useState<Recipe | null>(null);
+  const [previewServings, setPreviewServings] = useState(2);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [cookStep, setCookStep] = useState(0);
@@ -247,36 +272,99 @@ export default function App() {
     }
   }
 
-  function beginCooking(recipe: Recipe): boolean {
-    const scaled = recipe.ingredients
-      .filter(x => !x.optional)
-      .map((ri) => {
-        const match = ingredients.find(
-          i => i.name.trim().toLowerCase() === ri.name.trim().toLowerCase()
+  function openRecipe(recipe: Recipe) {
+    setPreview(recipe);
+    setPreviewServings(Math.max(1, Math.min(12, Math.round(recipe.servings || 2))));
+  }
+
+  // Keep the original AI recipe intact; scale a copy so cooking history
+  // stores the exact ingredient amounts for the selected serving count.
+  function scaledRecipe(recipe: Recipe, count: number): Recipe {
+    const base = Number(recipe.servings) > 0 ? Number(recipe.servings) : 2;
+    const ratio = count / base;
+    return {
+      ...recipe,
+      servings: count,
+      ingredients: recipe.ingredients.map(item => ({
+        ...item,
+        amount: Math.round(Number(item.amount) * ratio * 10000) / 10000
+      }))
+    };
+  }
+
+  function recipeAvailability(recipe: Recipe) {
+    return recipe.ingredients.map(item => {
+      const pantryItem = ingredients.find(
+        i => i.name.trim().toLowerCase() === item.name.trim().toLowerCase()
+      );
+      const neededInPantryUnit = pantryItem
+        ? pantryAmount(Number(item.amount), item.unit, pantryItem.unit)
+        : null;
+      const available = pantryItem?.amount ?? 0;
+      return {
+        item, pantryItem, neededInPantryUnit, available,
+        enough: !!pantryItem && neededInPantryUnit !== null &&
+          available + 0.000001 >= neededInPantryUnit,
+        incompatible: !!pantryItem && neededInPantryUnit === null
+      };
+    });
+  }
+
+  async function addMissingToShopping(recipe: Recipe) {
+    const missing = recipeAvailability(recipe).filter(x => !x.item.optional && !x.enough);
+    try {
+      for (const x of missing) {
+        const difference = x.neededInPantryUnit === null
+          ? Number(x.item.amount)
+          : Math.max(0, x.neededInPantryUnit - x.available);
+        const usePantryUnit = x.neededInPantryUnit !== null && x.pantryItem;
+        await addToShoppingList(
+          x.item.name,
+          x.pantryItem?.category || "Other",
+          Math.max(0.0001, difference),
+          usePantryUnit ? x.pantryItem!.unit : x.item.unit
         );
+      }
+      await refresh();
+      Alert.alert("Shopping list updated", `${missing.length} missing ingredient${missing.length === 1 ? "" : "s"} added.`);
+    } catch (e: any) {
+      Alert.alert("Couldn't update shopping list", e.message || "Please try again.");
+    }
+  }
 
-        return match ? {
-          ingredientId: match.id,
-          name: match.name,
-          unit: match.unit,
-          plannedAmount: ri.amount,
-          actualAmount: ri.amount,
-          usedSuggested: true
-        } : null;
-      })
-      .filter(Boolean) as CookItem[];
-
-    if (scaled.length === 0) {
+  function beginCooking(recipe: Recipe): boolean {
+    const availability = recipeAvailability(recipe);
+    const missing = availability.filter(x => !x.item.optional && !x.enough);
+    if (missing.length) {
       Alert.alert(
-        "Ingredients not matched",
-        "I couldn't match this recipe's ingredients to your pantry. Check that the ingredient names in your pantry match the recipe, then try again."
+        "Ingredients needed",
+        `Check your pantry before cooking: ${missing.map(x => x.item.name).join(", ")}. You can add missing ingredients to your shopping list.`
       );
       return false;
     }
-
-    setCookItems(scaled);
+    const cookingItems: CookItem[] = availability
+      .filter(x => x.enough && !!x.pantryItem)
+      .map(x => ({
+        ingredientId: x.pantryItem!.id,
+        name: x.pantryItem!.name,
+        unit: x.pantryItem!.unit,
+        plannedAmount: x.neededInPantryUnit!,
+        actualAmount: x.neededInPantryUnit!,
+        usedSuggested: true
+      }));
+    if (!cookingItems.length) {
+      Alert.alert("No matching pantry ingredients", "Check that your recipe uses the same ingredient names and compatible units as your pantry.");
+      return false;
+    }
+    const duplicateIds = new Set(cookingItems.map(i => i.ingredientId));
+    if (duplicateIds.size !== cookingItems.length) {
+      Alert.alert("Duplicate ingredients", "This recipe lists a pantry ingredient more than once. Please generate another recipe before cooking.");
+      return false;
+    }
+    setCookItems(cookingItems);
     setCookStep(0);
     setSelected(recipe);
+    setPreview(null);
     return true;
   }
 
@@ -399,11 +487,21 @@ export default function App() {
       {selected ? (
         <ScrollView contentContainerStyle={styles.content}>
           <TouchableOpacity onPress={() => setSelected(null)}>
-            <Text style={styles.back}>{historyDetail ? "‹ Back to recipe" : "‹ Back to recipes"}</Text>
+            <Text style={styles.back}>{historyDetail ? "‹ Back to history" : "‹ Back to recipes"}</Text>
           </TouchableOpacity>
 
           <Text style={styles.eyebrow}>COOKING MODE</Text>
           <Text style={styles.h1}>{selected.title}</Text>
+          <Text style={styles.muted}>Cooking {selected.servings} serving{selected.servings === 1 ? "" : "s"}</Text>
+          {cookStep < selected.steps.length && (
+            <TouchableOpacity style={styles.secondaryButton} onPress={() => {
+              Alert.alert("Ingredients for this recipe", selected.ingredients
+                .map(x => `${showAmount(Number(x.amount))} ${x.unit} ${x.name}${x.optional ? " (optional)" : ""}`)
+                .join("\n"));
+            }}>
+              <Text style={styles.secondaryText}>View ingredients</Text>
+            </TouchableOpacity>
+          )}
           {cookStep < selected.steps.length ? (
             <>
               <Text style={styles.muted}>
@@ -518,6 +616,93 @@ export default function App() {
             </>
           )}
         </ScrollView>
+      ) : preview ? (
+        <ScrollView contentContainerStyle={styles.content}>
+          <TouchableOpacity onPress={() => setPreview(null)}>
+            <Text style={styles.back}>‹ Back to {historyDetail ? "saved recipe" : "recipes"}</Text>
+          </TouchableOpacity>
+          <Text style={styles.eyebrow}>RECIPE PREVIEW</Text>
+          <Text style={styles.h1}>{preview.title}</Text>
+          <Text style={styles.muted}>
+            {preview.mealType} · {preview.prepMinutes} min prep · {preview.cookMinutes} min cook
+          </Text>
+          {!!preview.description && <Text style={styles.body}>{preview.description}</Text>}
+
+          <View style={styles.previewServingsCard}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.h2}>Servings</Text>
+              <Text style={styles.muted}>Ingredient amounts update automatically.</Text>
+            </View>
+            <View style={styles.previewStepper}>
+              <TouchableOpacity
+                style={styles.previewStepButton}
+                disabled={previewServings <= 1}
+                onPress={() => setPreviewServings(n => Math.max(1, n - 1))}
+              >
+                <Text style={styles.previewStepText}>−</Text>
+              </TouchableOpacity>
+              <Text style={styles.previewStepValue}>{previewServings}</Text>
+              <TouchableOpacity
+                style={styles.previewStepButton}
+                disabled={previewServings >= 12}
+                onPress={() => setPreviewServings(n => Math.min(12, n + 1))}
+              >
+                <Text style={styles.previewStepText}>+</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          <Text style={styles.h2}>Ingredients required</Text>
+          {recipeAvailability(scaledRecipe(preview, previewServings)).map((entry, i) => (
+            <View key={`${entry.item.name}-${i}`} style={styles.previewIngredientRow}>
+              <Text style={styles.previewIngredientMark}>
+                {entry.enough ? "✓" : entry.item.optional ? "○" : "!"}
+              </Text>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.itemName}>
+                  {showAmount(Number(entry.item.amount))} {entry.item.unit} {entry.item.name}
+                  {entry.item.optional ? " (optional)" : ""}
+                </Text>
+                <Text style={[styles.muted, !entry.enough && !entry.item.optional && styles.previewShortage]}>
+                  {entry.enough
+                    ? `In pantry: ${showAmount(entry.available)} ${entry.pantryItem!.unit}`
+                    : entry.incompatible
+                    ? `Pantry unit is ${entry.pantryItem!.unit}; quantity needs checking`
+                    : entry.item.optional
+                    ? "Optional · not currently available"
+                    : entry.pantryItem
+                    ? `Short by ${showAmount(Math.max(0, entry.neededInPantryUnit! - entry.available))} ${entry.pantryItem.unit}`
+                    : "Not in pantry"}
+                </Text>
+              </View>
+            </View>
+          ))}
+
+          {recipeAvailability(scaledRecipe(preview, previewServings)).some(x => !x.item.optional && !x.enough) ? (
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              onPress={() => addMissingToShopping(scaledRecipe(preview, previewServings))}
+            >
+              <Text style={styles.secondaryText}>＋ Add missing ingredients to shopping list</Text>
+            </TouchableOpacity>
+          ) : (
+            <Text style={styles.previewReady}>✓ You have the required ingredients.</Text>
+          )}
+
+          <Text style={styles.h2}>Cooking instructions</Text>
+          {preview.steps.map((step, i) => (
+            <View key={`preview-step-${i}`} style={styles.historyStepRow}>
+              <Text style={styles.historyStepNumber}>{i + 1}</Text>
+              <Text style={[styles.body, { flex: 1 }]}>{step}</Text>
+            </View>
+          ))}
+          <TouchableOpacity
+            style={styles.primaryButton}
+            onPress={() => beginCooking(scaledRecipe(preview, previewServings))}
+          >
+            <Text style={styles.primaryText}>Start cooking · {previewServings} servings →</Text>
+          </TouchableOpacity>
+        </ScrollView>
       ) : historyDetail ? (
         <ScrollView contentContainerStyle={styles.content}>
           <TouchableOpacity onPress={() => setHistoryDetail(null)}>
@@ -556,7 +741,7 @@ export default function App() {
 
           <TouchableOpacity
             style={styles.primaryButton}
-            onPress={() => beginCooking(historyDetail)}
+            onPress={() => openRecipe(historyDetail)}
           >
             <Text style={styles.primaryText}>Cook this recipe again</Text>
           </TouchableOpacity>
@@ -861,7 +1046,7 @@ export default function App() {
                   <TouchableOpacity
                     key={`${r.title}-${i}`}
                     style={styles.recipeCard}
-                    onPress={() => beginCooking(r)}
+                    onPress={() => openRecipe(r)}
                   >
                     <View style={styles.recipeEmoji}>
                       <Text style={{ fontSize: 30 }}>🍲</Text>
@@ -1359,6 +1544,15 @@ const styles = StyleSheet.create({
   unitOptionSelected: { backgroundColor: "#E3F1E5", borderColor: GREEN },
   unitOptionText: { color: "#35433A", fontWeight: "700" },
   unitOptionTextSelected: { color: GREEN },
+  previewServingsCard: { flexDirection: "row", alignItems: "center", backgroundColor: "#fff", padding: 16, borderRadius: 16, marginTop: 20, marginBottom: 22, gap: 10 },
+  previewStepper: { flexDirection: "row", alignItems: "center", gap: 10 },
+  previewStepButton: { backgroundColor: PALE, width: 38, height: 38, borderRadius: 11, alignItems: "center", justifyContent: "center" },
+  previewStepText: { fontSize: 23, color: GREEN, fontWeight: "700" },
+  previewStepValue: { fontSize: 19, color: "#18251D", fontWeight: "800", minWidth: 24, textAlign: "center" },
+  previewIngredientRow: { flexDirection: "row", alignItems: "center", gap: 12, padding: 13, borderBottomWidth: 1, borderBottomColor: "#E2DED4", backgroundColor: "#fff" },
+  previewIngredientMark: { color: GREEN, fontWeight: "900", fontSize: 19, width: 25, textAlign: "center" },
+  previewShortage: { color: "#A06415" },
+  previewReady: { color: GREEN, fontWeight: "700", marginTop: 12, marginBottom: 10 },
   historyLine: { paddingVertical: 9, color: "#344239" },
   historyCard: {
     backgroundColor: "#fff",
